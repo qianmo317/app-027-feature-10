@@ -4,8 +4,10 @@ import { dedupeSharedEdges } from './exporters'
 import { makeContour } from './cleanup'
 import { boundsOf, dist } from './geometry'
 import type { CutStep } from './order'
+import { stepKey } from './manualOrder'
+import type { OverrideMeta } from './manualOrder'
 
-export type JobStep = CutStep & { shapeId: string; shapeName: string; shapeLayer: number }
+export type JobStep = CutStep & { shapeId: string; shapeName: string; shapeLayer: number; /** 稳定标识：轮廓 id#段序号，共边去重后会追加片段号 */ okey: string }
 
 export type Job = {
   steps: JobStep[]
@@ -16,6 +18,8 @@ export type Job = {
   runCount: number
   perShape: Record<string, number>
   shapeOrder: string[]
+  /** 手工顺序元信息（无手工干预时为 null，此时 steps 即自动顺序） */
+  orderMeta: OverrideMeta | null
 }
 
 /** 批量排版：同一纹样在纸上排满（间距可调，间距为 0 时可共边裁切） */
@@ -37,13 +41,16 @@ export function buildBatchShape(shape: Shape, batch: BatchCfg): Shape {
       const mirrorY = batch.mode === 'four_way' && r % 2 === 1
       const ox = b.minX + c * stepX
       const oy = b.minY + r * stepY
-      for (const src of shape.contours) {
+      for (let ci = 0; ci < shape.contours.length; ci++) {
+        const src = shape.contours[ci]
         const pts = src.points.map((p) => {
           const x = mirrorX ? b.maxX - (p.x - b.minX) : p.x
           const y = mirrorY ? b.maxY - (p.y - b.minY) : p.y
           return { x: x - b.minX + ox, y: y - b.minY + oy }
         })
+        // 稳定 id（行列 + 源轮廓），保证手工顺序在反复重算后仍能对上
         const nc = makeContour(pts, src.closed, src.warnings.filter((wn) => wn === 'not_closed' || wn === 'self_intersect'))
+        nc.id = `${src.id}@r${r}c${c}`
         contours.push(nc)
       }
     }
@@ -132,6 +139,7 @@ export function buildJob(
           shapeId: item.shape.id,
           shapeName: item.shape.name,
           shapeLayer: item.shape.layer,
+          okey: stepKey(st),
           travelFromPrevMm: st === steps[0] ? prevTravel : st.travelFromPrevMm,
         })
       }
@@ -146,10 +154,9 @@ export function buildJob(
   const naiveSteps = build(naiveShapeOrder, true)
 
   if (opts.sharedEdge) {
-    steps = dedupeSharedEdges(steps)
+    steps = dedupeSharedEdges(steps, undefined, 'okey')
     steps = steps.map((s, i) => ({ ...s, seq: i + 1 }))
   }
-
   const travelMm = steps.reduce((a, s) => a + s.travelFromPrevMm, 0)
   const naiveTravelMm = naiveSteps.reduce((a, s) => a + s.travelFromPrevMm, 0)
   const cutLengthMm = steps.reduce((a, s) => a + s.lengthMm, 0)
@@ -165,6 +172,7 @@ export function buildJob(
     runCount: steps.length,
     perShape,
     shapeOrder,
+    orderMeta: null,
   }
 }
 

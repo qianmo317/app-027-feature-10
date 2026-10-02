@@ -83,6 +83,8 @@ export type Project = {
   batch?: BatchCfg
   /** 批量排版的对象形状（同一纹样排满一张纸） */
   batchShapeId?: string
+  /** 手工切割顺序（拖动 / 固定），缺省 = 全自动顺序 */
+  orderOverride?: OrderOverride
 }
 
 export type BatchCfg = {
@@ -94,6 +96,17 @@ export type BatchCfg = {
   /** 共边裁切：间距为 0 时相邻轮廓共边，重叠路径只切一次 */
   sharedEdge: boolean
   mode: 'repeat' | 'four_way'
+}
+
+/**
+ * 手工切割顺序覆盖（任务级，key 形如 `${contourId}#${runIndex}`）：
+ * - order 为空 + pinned 非空：自动顺序保持，但重排时绕开固定段
+ * - order 非空：完全按手工顺序生效
+ * 几何变化后对不上的 key 自动剔除并补齐新段。
+ */
+export type OrderOverride = {
+  order: string[]
+  pinned: string[]
 }
 
 export const DEFAULT_CUT_SETTINGS: CutSettings = {

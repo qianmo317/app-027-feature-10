@@ -45,6 +45,8 @@ const computedMap = computed(() => {
 
 const cfg = computed<ExportCfg>(() => project.value?.export ?? { format: 'plt', unit: '0.025mm', origin: 'bottom_left', yFlip: true, scale: 1 })
 
+const orderMeta = computed(() => job.value?.orderMeta ?? null)
+
 const placement = computed(() => {
   const p = project.value
   if (!p || !job.value) return null
@@ -189,6 +191,7 @@ function downloadA4(): void {
         ref="canvas"
         :shapes="shapesForCanvas"
         :computed="computedMap"
+        :job="job"
         mode="toolpath"
         tool="select"
         :sheet="project.sheet"
@@ -213,6 +216,11 @@ function downloadA4(): void {
         <button class="tiny primary" @click="doDownload">下载 {{ cfg.format.toUpperCase() }}</button>
       </div>
       <div class="panel-body">
+        <div v-if="orderMeta" class="banner warn">
+          当前导出使用<strong>手工调整后的顺序</strong>：跳刀 {{ orderMeta.travelMm.toFixed(1) }}mm，
+          比自动顺序多走 {{ orderMeta.extraTravelMm.toFixed(1) }}mm；文件 / 检查图 / 坐标校验均按此顺序生成。
+          <RouterLink :to="`/layout/${project.id}`">回去改顺序</RouterLink>
+        </div>
         <div class="section">
           <div class="section-title">格式与单位</div>
           <div class="field-row">
@@ -338,6 +346,21 @@ function downloadA4(): void {
 </template>
 
 <style scoped>
+.banner.warn {
+  background: rgba(255, 200, 87, 0.1);
+  border: 1px solid rgba(255, 200, 87, 0.4);
+  color: #ffe0a0;
+  padding: 7px 9px;
+  border-radius: 6px;
+  margin-bottom: 8px;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.banner.warn a {
+  color: var(--accent-2);
+}
+
 .code-preview {
   background: #0e1216;
   border: 1px solid var(--line);

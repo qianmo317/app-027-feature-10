@@ -8,12 +8,14 @@ import {
   type CutSettings,
   type ExportCfg,
   type MaterialPreset,
+  type OrderOverride,
   type Project,
   type Shape,
   type Sheet,
 } from './types'
 import { computeShape, shapeSignature, type ComputedShape } from './pipeline'
 import { buildBatchShape, buildJob, type Job } from './job'
+import { applyOrderOverride, moveKey } from './manualOrder'
 import { uid } from './geometry'
 import { importSvgText, type ImportResult } from './importer'
 import { defaultMaterials } from '@/data/materials'
@@ -106,6 +108,7 @@ function normalizeProject(p: Project): Project {
       contours: (s.contours ?? []).map((c) => ({ ...c, holes: c.holes ?? [], bridges: c.bridges ?? [], warnings: c.warnings ?? [] })),
     })),
     layerNames: p.layerNames ?? ['图层 1'],
+    orderOverride: p.orderOverride ? { order: p.orderOverride.order ?? [], pinned: p.orderOverride.pinned ?? [] } : undefined,
   }
 }
 
@@ -145,6 +148,21 @@ export function computedOf(shapeId: string): ComputedShape | null {
   return computedCache[shapeId] ?? null
 }
 
+/** 应用项目级手工顺序覆盖（拖动 / 固定），返回可能被重排过的新 Job */
+function withOrderOverride(job: Job, p: Project, start: { x: number; y: number }): Job {
+  const ov = p.orderOverride
+  if (!ov || (ov.order.length === 0 && ov.pinned.length === 0)) return job
+  const { steps, meta } = applyOrderOverride(job.steps, ov, start, undefined, (s) => s.okey)
+  return {
+    ...job,
+    steps,
+    travelMm: meta.travelMm,
+    cutLengthMm: job.cutLengthMm,
+    runCount: steps.length,
+    orderMeta: { ...meta, naiveTravelMm: job.naiveTravelMm },
+  }
+}
+
 /** 排版任务：批量排版开启时只排所选纹样，否则排全部形状 */
 export function jobOf(p: Project): { job: Job; shape: Shape | null; isBatch: boolean; computed: Map<string, ComputedShape> } {
   const material = materialOf(p)
@@ -165,7 +183,8 @@ export function jobOf(p: Project): { job: Job; shape: Shape | null; isBatch: boo
         }
       }
       const map = new Map<string, ComputedShape>([[tiled.id, comp]])
-      const job = buildJob([tiled], map, layerOrderOf(p), { sharedEdge: batch.sharedEdge, start })
+      const baseJob = buildJob([tiled], map, layerOrderOf(p), { sharedEdge: batch.sharedEdge, start })
+      const job = withOrderOverride(baseJob, p, start)
       return { job, shape: tiled, isBatch: true, computed: map }
     }
   }
@@ -175,7 +194,8 @@ export function jobOf(p: Project): { job: Job; shape: Shape | null; isBatch: boo
     const c = computedCache[s.id]
     if (c) map.set(s.id, c)
   }
-  const job = buildJob(p.shapes, map, layerOrderOf(p), { sharedEdge: false, start })
+  const baseJob = buildJob(p.shapes, map, layerOrderOf(p), { sharedEdge: false, start })
+  const job = withOrderOverride(baseJob, p, start)
   return { job, shape: null, isBatch: false, computed: map }
 }
 
@@ -409,6 +429,59 @@ export function applySymmetry(p: Project, shapeId: string, op: 'mirror_x' | 'mir
   touch(p)
 }
 
+// ---------------- 手工切割顺序 ----------------
+
+function overrideOf(p: Project): OrderOverride {
+  if (!p.orderOverride) p.orderOverride = { order: [], pinned: [] }
+  return p.orderOverride
+}
+
+/** 取当前生效顺序的 key 列表（有手工干预时为手工顺序，否则为自动顺序） */
+export function effectiveOrderKeys(p: Project): string[] {
+  const { job } = jobOf(p)
+  return job.steps.map((s) => s.okey)
+}
+
+/** 拖动：把某段移到目标位置（首次拖动时以自动顺序为基准） */
+export function reorderCutStep(p: Project, key: string, toIndex: number): void {
+  const ov = overrideOf(p)
+  const base = ov.order.length > 0 ? ov.order : effectiveOrderKeys(p)
+  ov.order = moveKey(base, key, toIndex)
+  touch(p)
+}
+
+/** 固定 / 取消固定某段（固定位置 = 当前生效位置；纯固定模式下重排会绕开它） */
+export function pinCutStep(p: Project, key: string, pinned: boolean): void {
+  const ov = overrideOf(p)
+  const pinnedSet = new Set(ov.pinned)
+  if (pinned) pinnedSet.add(key)
+  else pinnedSet.delete(key)
+  // 固定集合按当前生效顺序排列，使 applyOrderOverride 的锚点槽位与画面一致
+  const cur = effectiveOrderKeys(p)
+  ov.pinned = cur.filter((k) => pinnedSet.has(k))
+  touch(p)
+}
+
+/**
+ * 绕开固定段重新就近优化：固定段位置不动，其余自由段重排。
+ * 固定槽位以当前生效顺序为锚，重排结果写回手工顺序（可继续拖动 / 退回自动）。
+ */
+export function optimizeAroundPins(p: Project): void {
+  const ov = overrideOf(p)
+  if (ov.pinned.length === 0) return
+  const { job } = jobOf(p)
+  const curKeys = job.steps.map((s) => s.okey)
+  const { steps } = applyOrderOverride(job.steps, { order: [], pinned: ov.pinned }, { x: 0, y: 0 }, curKeys, (s) => s.okey)
+  ov.order = steps.map((s) => s.okey)
+  touch(p)
+}
+
+/** 一键退回自动结果（清空手工顺序与固定） */
+export function resetCutOrder(p: Project): void {
+  p.orderOverride = { order: [], pinned: [] }
+  touch(p)
+}
+
 // ---------------- 材料预设 ----------------
 
 export function upsertMaterial(m: MaterialPreset): void {
@@ -492,4 +565,9 @@ export const store = {
   recomputeAll,
   importSvgToShapes,
   touch,
+  effectiveOrderKeys,
+  reorderCutStep,
+  pinCutStep,
+  optimizeAroundPins,
+  resetCutOrder,
 }

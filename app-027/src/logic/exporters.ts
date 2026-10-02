@@ -359,8 +359,8 @@ function escapeXml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
 }
 
-/** 共边裁切：同一段路径只切一次（相邻复制件重叠的边） */
-export function dedupeSharedEdges<T extends CutStep>(steps: T[], tol = 0.02): T[] {
+/** 共边裁切：同一段路径只切一次（相邻复制件重叠的边）；keyField 为片段的稳定标识字段名 */
+export function dedupeSharedEdges<T extends CutStep>(steps: T[], tol = 0.02, keyField?: keyof T): T[] {
   const seen = new Set<string>()
   const key = (a: Pt, b: Pt): string => {
     const f = (v: number) => Math.round(v / tol)
@@ -393,10 +393,10 @@ export function dedupeSharedEdges<T extends CutStep>(steps: T[], tol = 0.02): T[
     } else if (cur.length >= 2) {
       runs.push(cur)
     }
-    for (const r of runs) {
-      if (r.length < 2) continue
+    runs.forEach((r, fi) => {
+      if (r.length < 2) return
       seq += 1
-      out.push({
+      const frag = {
         ...st,
         seq,
         points: r,
@@ -405,8 +405,10 @@ export function dedupeSharedEdges<T extends CutStep>(steps: T[], tol = 0.02): T[
         endPt: r[r.length - 1],
         travelFromPrevMm: 0,
         lengthMm: r.reduce((acc, p, i) => (i === 0 ? 0 : acc + dist(r[i - 1], p)), 0),
-      })
-    }
+      }
+      if (keyField) (frag as Record<string, unknown>)[keyField as string] = `${String(st[keyField])}/f${fi}`
+      out.push(frag)
+    })
   }
   return out
 }

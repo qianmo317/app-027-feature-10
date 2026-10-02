@@ -28,6 +28,8 @@ const props = withDefaults(
     simIndex?: number
     placement?: SheetPlacement | null
     statusText?: string
+    /** 顺序表中选中的段序号（1 起），高亮该段刀路 */
+    activeSeq?: number | null
   }>(),
   {
     job: null,
@@ -43,6 +45,7 @@ const props = withDefaults(
     simIndex: -1,
     placement: null,
     statusText: '',
+    activeSeq: null,
   },
 )
 
@@ -343,8 +346,10 @@ const cutSteps = computed<CutStep[]>(() => {
 const cutPaths = computed(() =>
   cutSteps.value.map((st, i) => ({
     i,
+    seq: st.seq,
     d: pointsToD(st.points.map(pl), st.closed),
     selected: st.contourId === props.selectedContourId,
+    active: props.activeSeq != null && st.seq === props.activeSeq,
   })),
 )
 
@@ -540,8 +545,8 @@ function focusContour(id: string): void {
             v-for="p in cutPaths"
             :key="`cut${p.i}`"
             :d="p.d"
-            :stroke="p.selected ? '#47c07a' : '#ff8f3c'"
-            :stroke-width="p.selected ? 2.4 : 1.7"
+            :stroke="p.active ? '#ffe66d' : p.selected ? '#47c07a' : '#ff8f3c'"
+            :stroke-width="p.active || p.selected ? 2.6 : 1.7"
             vector-effect="non-scaling-stroke"
           />
         </g>
@@ -554,13 +559,20 @@ function focusContour(id: string): void {
         <!-- 顺序编号 -->
         <g v-if="mode === 'toolpath' && showNumbers">
           <g v-for="n in numbers" :key="`n${n.i}`">
-            <circle :cx="n.x" :cy="n.y" :r="7 / zoom" fill="#12161b" stroke="#ff8f3c" :stroke-width="1.4 / zoom" />
+            <circle
+              :cx="n.x"
+              :cy="n.y"
+              :r="7 / zoom"
+              :fill="activeSeq === n.i ? '#ffe66d' : '#12161b'"
+              :stroke="activeSeq === n.i ? '#ffe66d' : '#ff8f3c'"
+              :stroke-width="1.4 / zoom"
+            />
             <text
               :x="n.x"
               :y="n.y + 2.6 / zoom"
               :font-size="8 / zoom"
               text-anchor="middle"
-              fill="#ffb066"
+              :fill="activeSeq === n.i ? '#12161b' : '#ffb066'"
               font-family="Plotter Mono, monospace"
             >
               {{ n.i }}
