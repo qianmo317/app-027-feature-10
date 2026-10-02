@@ -1,9 +1,10 @@
-import type { BatchCfg, Contour, Pt, Shape } from './types'
+import type { BatchCfg, Contour, OrderOverride, Pt, Shape } from './types'
 import type { ComputedShape } from './pipeline'
 import { dedupeSharedEdges } from './exporters'
 import { makeContour } from './cleanup'
 import { boundsOf, dist } from './geometry'
 import type { CutStep } from './order'
+import { resolveManual, stepKey, type ManualOrderResult } from './manualOrder'
 
 export type JobStep = CutStep & { shapeId: string; shapeName: string; shapeLayer: number }
 
@@ -16,6 +17,15 @@ export type Job = {
   runCount: number
   perShape: Record<string, number>
   shapeOrder: string[]
+  /** 自动优化顺序的段（手工调整前），用于对比 */
+  autoSteps: JobStep[]
+  autoTravelMm: number
+  /** 是否正在使用手工顺序 */
+  manual: boolean
+  /** 手工顺序是否因几何变化而失效（需要一键退回自动） */
+  manualStale: boolean
+  /** 手工顺序对比信息（manual 生效时） */
+  manualResult: ManualOrderResult | null
 }
 
 /** 批量排版：同一纹样在纸上排满（间距可调，间距为 0 时可共边裁切） */
@@ -63,12 +73,13 @@ function shapeEnd(s: ComputedShape): Pt {
 
 /**
  * 组合多形状 / 多图层的切割任务：图层顺序 → 同层形状最近邻 → 各形状内部先内后外。
+ * override 存在且匹配当前几何时，段顺序按手工结果排列（跳刀重新计算）。
  */
 export function buildJob(
   shapes: Shape[],
   computedById: Map<string, ComputedShape>,
   layerOrder: number[],
-  opts: { sharedEdge: boolean; start: Pt },
+  opts: { sharedEdge: boolean; start: Pt; override?: OrderOverride | null },
 ): Job {
   const list = shapes.map((s) => ({ shape: s, comp: computedById.get(s.id) })).filter((x) => x.comp) as Array<{
     shape: Shape
@@ -142,8 +153,15 @@ export function buildJob(
     return out
   }
 
-  let steps = build(shapeOrder, true)
+  const autoSteps = build(shapeOrder, true)
   const naiveSteps = build(naiveShapeOrder, true)
+
+  // 手工顺序：段集合匹配时按手工排列（跳刀已在 resolveManual 中重算）；几何已变则标记失效并回退自动
+  const manualResult = opts.override ? resolveManual(autoSteps, opts.override) : null
+  const manualStale = !!opts.override && manualResult === null
+  let steps = manualResult
+    ? manualResult.order.map((k) => manualResult!.byKey.get(k)!)
+    : autoSteps
 
   if (opts.sharedEdge) {
     steps = dedupeSharedEdges(steps)
@@ -151,10 +169,17 @@ export function buildJob(
   }
 
   const travelMm = steps.reduce((a, s) => a + s.travelFromPrevMm, 0)
+  const autoTravelMm = autoSteps.reduce((a, s) => a + s.travelFromPrevMm, 0)
   const naiveTravelMm = naiveSteps.reduce((a, s) => a + s.travelFromPrevMm, 0)
   const cutLengthMm = steps.reduce((a, s) => a + s.lengthMm, 0)
   const perShape: Record<string, number> = {}
   for (const s of steps) perShape[s.shapeId] = (perShape[s.shapeId] ?? 0) + 1
+
+  if (manualResult) {
+    manualResult.stats.naiveTravelMm = naiveTravelMm
+    manualResult.stats.improvementPct =
+      naiveTravelMm > 1e-9 ? ((naiveTravelMm - travelMm) / naiveTravelMm) * 100 : 0
+  }
 
   return {
     steps,
@@ -165,8 +190,23 @@ export function buildJob(
     runCount: steps.length,
     perShape,
     shapeOrder,
+    autoSteps,
+    autoTravelMm,
+    manual: !!manualResult,
+    manualStale,
+    manualResult,
   }
 }
+
+/** 预计机时（s）：切割时间（含重复次数）+ 跳刀空移时间 */
+export function estimateSeconds(job: Pick<Job, 'cutLengthMm' | 'travelMm'>, cutSpeedMmS: number, passes: number, travelSpeedMmS = 120): number {
+  const cut = (job.cutLengthMm * Math.max(1, passes)) / Math.max(1, cutSpeedMmS)
+  const travel = job.travelMm / Math.max(1, travelSpeedMmS)
+  return cut + travel
+}
+
+/** 段 key（供视图拖动 / 固定使用） */
+export { stepKey }
 
 /** 仿真关键点（按顺序展开的刀尖轨迹） */
 export type SimPoint = { p: Pt; cut: boolean; stepIndex: number; contourId: string }

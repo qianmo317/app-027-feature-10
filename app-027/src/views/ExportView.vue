@@ -283,6 +283,28 @@ function downloadA4(): void {
           </div>
         </div>
 
+        <div class="section" v-if="job">
+          <div class="section-title">
+            导出顺序
+            <span class="spacer" style="margin-left:auto"></span>
+            <RouterLink class="tiny" :to="`/layout/${project.id}`">返回排版调序</RouterLink>
+          </div>
+          <div class="hint" v-if="job.manual">
+            当前导出按<span style="color: var(--info)">手工顺序</span>（{{ job.runCount }} 段）：跳刀 {{ job.travelMm.toFixed(1) }}mm；
+            自动顺序为 {{ job.autoTravelMm.toFixed(1) }}mm
+            <template v-if="(job.manualResult?.stats.extraTravelMm ?? 0) > 0.005">
+              ，手工较自动多走 <b style="color: var(--warn)">{{ job.manualResult!.stats.extraTravelMm.toFixed(1) }}mm</b>
+            </template>
+            ；固定 {{ job.manualResult?.stats.pinnedCount ?? 0 }} 段。
+          </div>
+          <div class="hint" v-else-if="job.manualStale">
+            原有手工顺序因几何变化已失效，当前按自动顺序导出。
+          </div>
+          <div class="hint" v-else>
+            当前导出按<span style="color: var(--accent-2)">自动优化顺序</span>（{{ job.runCount }} 段，先内后外 + 最近邻/2-opt）：跳刀 {{ job.travelMm.toFixed(1) }}mm，可在排版页手工调序。
+          </div>
+        </div>
+
         <div class="section" v-if="stats">
           <div class="section-title">导出坐标校验</div>
           <div class="stat-grid">

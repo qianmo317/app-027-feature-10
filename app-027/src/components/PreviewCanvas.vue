@@ -28,6 +28,8 @@ const props = withDefaults(
     simIndex?: number
     placement?: SheetPlacement | null
     statusText?: string
+    /** 手工固定的段（显示绿色图钉环） */
+    pinnedKeys?: string[]
   }>(),
   {
     job: null,
@@ -43,6 +45,7 @@ const props = withDefaults(
     simIndex: -1,
     placement: null,
     statusText: '',
+    pinnedKeys: () => [],
   },
 )
 
@@ -369,6 +372,22 @@ const numbers = computed(() => {
   })
 })
 
+/** 手工固定段的起点标记（绿色图钉环） */
+const pinMarkers = computed(() => {
+  const set = new Set(props.pinnedKeys)
+  if (set.size === 0) return []
+  const out: Array<{ x: number; y: number; i: number }> = []
+  cutSteps.value.forEach((st, i) => {
+    const sid = 'shapeId' in st ? (st as { shapeId?: string }).shapeId ?? '' : ''
+    const key = `${sid}:${st.contourId}:${st.runIndex}`
+    if (set.has(key)) {
+      const p = pl(st.startPt)
+      out.push({ x: p.x, y: p.y, i: i + 1 })
+    }
+  })
+  return out
+})
+
 /** 连刀点缺口（来自派生结果，用于放大视图） */
 const bridges = computed(() => {
   const out: Array<{ x: number; y: number; end: Pt; widthMm: number; local: Pt[]; contourId: string }> = []
@@ -564,6 +583,22 @@ function focusContour(id: string): void {
               font-family="Plotter Mono, monospace"
             >
               {{ n.i }}
+            </text>
+          </g>
+        </g>
+
+        <!-- 手工固定段标记 -->
+        <g v-if="pinMarkers.length > 0">
+          <g v-for="m in pinMarkers" :key="`pin${m.i}`">
+            <circle :cx="m.x" :cy="m.y" :r="10 / zoom" fill="none" stroke="#47c07a" :stroke-width="2 / zoom" />
+            <text
+              :x="m.x"
+              :y="m.y + 3.4 / zoom"
+              :font-size="9 / zoom"
+              text-anchor="middle"
+              fill="#47c07a"
+            >
+              ▣
             </text>
           </g>
         </g>

@@ -3,7 +3,7 @@ import { computed, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import PreviewCanvas from '@/components/PreviewCanvas.vue'
 import { store } from '@/logic/store'
-import { simulationPath, type JobStep } from '@/logic/job'
+import { estimateSeconds, simulationPath, stepKey, type JobStep } from '@/logic/job'
 import type { ComputedShape } from '@/logic/pipeline'
 import type { Pt } from '@/logic/types'
 import { boundsOf, mergeBounds } from '@/logic/geometry'
@@ -73,6 +73,112 @@ function locateStep(st: JobStep): void {
   canvas.value?.focusContour(st.contourId)
 }
 
+// ---------------- 手工调序 ----------------
+const manual = computed(() => !!job.value?.manual)
+const manualStale = computed(() => !!job.value?.manualStale)
+const manualInfo = computed(() => job.value?.manualResult ?? null)
+const pinnedSet = computed(() => new Set(manualInfo.value?.pinned ?? []))
+const isBatchMode = computed(() => !!jobData.value?.isBatch)
+
+function beginManual(): void {
+  const p = project.value
+  if (!p) return
+  store.beginManualOrder(p)
+  selectedSeq.value = null
+}
+
+function resetManual(): void {
+  const p = project.value
+  if (!p) return
+  store.resetManualOrder(p)
+  selectedSeq.value = null
+}
+
+function dropStale(): void {
+  const p = project.value
+  if (p) store.dropStaleManualOrder(p)
+}
+
+function reopt(): void {
+  const p = project.value
+  if (p) store.reoptimizeManualOrder(p)
+}
+
+function togglePin(st: JobStep): void {
+  const p = project.value
+  if (p) store.toggleManualPin(p, stepKey(st))
+}
+
+// 原生 HTML5 拖动
+const dragKey = ref<string | null>(null)
+
+function onDragStart(e: DragEvent, st: JobStep): void {
+  dragKey.value = stepKey(st)
+  if (e.dataTransfer) {
+    e.dataTransfer.effectAllowed = 'move'
+    e.dataTransfer.setData('text/plain', dragKey.value)
+  }
+}
+
+function onDrop(e: DragEvent, target: JobStep): void {
+  e.preventDefault()
+  const p = project.value
+  const key = dragKey.value
+  dragKey.value = null
+  if (!p || !key) return
+  // 目标绝对位置：插到 target 所在位置（target 及之后顺延）
+  const to = steps.value.findIndex((s) => stepKey(s) === stepKey(target))
+  if (to < 0) return
+  store.moveManualStep(p, key, to)
+}
+
+function onDragOver(e: DragEvent): void {
+  if (dragKey.value) e.preventDefault()
+}
+
+/** 自动顺序中该段的序号（用于对比着色） */
+const autoRankByKey = computed(() => {
+  const m = new Map<string, number>()
+  job.value?.autoSteps.forEach((st, i) => m.set(stepKey(st), i))
+  return m
+})
+
+function rankDelta(st: JobStep): number {
+  const cur = st.seq - 1
+  const auto = autoRankByKey.value.get(stepKey(st))
+  return auto === undefined ? 0 : cur - auto
+}
+
+// ---------------- 打印材料卡 ----------------
+const travelSpeedMmS = 120
+const printTime = computed(() => {
+  const p = project.value
+  if (!p || !material.value || !job.value) return '-'
+  const sec = estimateSeconds(job.value, material.value.speedMmS, material.value.passes, travelSpeedMmS)
+  return sec >= 120 ? `${(sec / 60).toFixed(1)} min` : `${sec.toFixed(0)} s`
+})
+
+const autoTime = computed(() => {
+  const p = project.value
+  if (!p || !material.value || !job.value) return null
+  const sec = estimateSeconds(
+    { cutLengthMm: job.value.cutLengthMm, travelMm: job.value.autoTravelMm },
+    material.value.speedMmS,
+    material.value.passes,
+    travelSpeedMmS,
+  )
+  return sec >= 120 ? `${(sec / 60).toFixed(1)} min` : `${sec.toFixed(0)} s`
+})
+
+const extraTravel = computed(() => manualInfo.value?.stats.extraTravelMm ?? 0)
+const extraTime = computed(() => {
+  const ex = extraTravel.value
+  if (ex <= 1e-9) return null
+  const sec = ex / travelSpeedMmS
+  return sec >= 60 ? `${(sec / 60).toFixed(1)} min` : `${sec.toFixed(1)} s`
+})
+
+// ---------------- 图层 ----------------
 const layers = computed(() => {
   const p = project.value
   if (!p) return []
@@ -228,14 +334,6 @@ function printCard(): void {
   window.print()
 }
 
-const printTime = computed(() => {
-  const p = project.value
-  if (!p || !material.value) return '-'
-  const speed = Math.max(1, material.value.speedMmS)
-  const total = (job.value?.cutLengthMm ?? 0) * material.value.passes
-  return `${(total / speed).toFixed(0)} s`
-})
-
 const boundsInfo = computed(() => {
   const pts: Pt[] = []
   for (const st of steps.value) pts.push(...st.points)
@@ -259,6 +357,7 @@ const boundsInfo = computed(() => {
         ref="canvas"
         :shapes="shapesForCanvas"
         :computed="computedMap"
+        :job="job"
         mode="toolpath"
         tool="select"
         :sheet="project.sheet"
@@ -267,6 +366,7 @@ const boundsInfo = computed(() => {
         :placement="placement"
         :sim-path="simPts"
         :sim-index="simPts ? simPts.length - 1 : -1"
+        :pinned-keys="manualInfo?.pinned ?? []"
         :status-text="currentStep ? `正在切 #${currentStep.seq}` : ''"
         @select-contour="selectedSeq = null"
       />
@@ -286,14 +386,34 @@ const boundsInfo = computed(() => {
       <div class="panel-body">
         <div class="stat-grid">
           <div class="stat"><div class="k">刀路总长</div><div class="v">{{ (job?.cutLengthMm ?? 0).toFixed(1) }}<small>mm</small></div></div>
-          <div class="stat"><div class="k">跳刀（优化后）</div><div class="v">{{ (job?.travelMm ?? 0).toFixed(1) }}<small>mm</small></div></div>
+          <div class="stat">
+            <div class="k">{{ manual ? '跳刀（手工）' : '跳刀（优化后）' }}</div>
+            <div class="v" :style="{ color: manual ? 'var(--info)' : '' }">{{ (job?.travelMm ?? 0).toFixed(1) }}<small>mm</small></div>
+          </div>
+          <div class="stat"><div class="k">跳刀（自动顺序）</div><div class="v">{{ (job?.autoTravelMm ?? job?.naiveTravelMm ?? 0).toFixed(1) }}<small>mm</small></div></div>
           <div class="stat"><div class="k">跳刀（朴素顺序）</div><div class="v">{{ (job?.naiveTravelMm ?? 0).toFixed(1) }}<small>mm</small></div></div>
           <div class="stat">
-            <div class="k">缩短比例</div>
-            <div class="v" :style="{ color: (job?.improvementPct ?? 0) >= 15 ? 'var(--ok)' : '' }">{{ (job?.improvementPct ?? 0).toFixed(1) }}<small>%</small></div>
+            <div class="k">预计用时</div>
+            <div class="v" style="font-size: 13px">{{ printTime }}</div>
+            <div v-if="manual && autoTime" class="hint" style="margin-top: 1px">自动顺序约 {{ autoTime }}</div>
           </div>
           <div class="stat"><div class="k">纹样尺寸</div><div class="v">{{ boundsInfo ? boundsInfo.w.toFixed(0) + '×' + boundsInfo.h.toFixed(0) : '-' }}<small>mm</small></div></div>
-          <div class="stat"><div class="k">预计用时</div><div class="v">{{ printTime }}</div></div>
+        </div>
+
+        <div v-if="manualStale" class="banner warn">
+          纹样几何已变化，原手工顺序与当前刀路段不对应，已临时按自动顺序显示。
+          <button class="tiny primary" @click="dropStale">丢弃手工调整，退回自动</button>
+        </div>
+
+        <div v-if="manual && !manualStale && manualInfo" class="banner manual">
+          <span>
+            手工调序中：<b>{{ manualInfo.stats.movedCount }}</b> 段移位
+            <template v-if="manualInfo.stats.pinnedCount > 0">｜<b>{{ manualInfo.stats.pinnedCount }}</b> 段固定</template>
+            <template v-if="extraTravel > 0.005">
+              ｜相对自动顺序<b style="color: var(--warn)">多走 {{ extraTravel.toFixed(1) }}mm</b><span v-if="extraTime">（≈{{ extraTime }}）</span>
+            </template>
+            <template v-else>｜<span style="color: var(--ok)">未增加跳刀</span></template>
+          </span>
         </div>
 
         <div v-if="fitInfo && !fitInfo.fits" class="banner warn">
@@ -305,27 +425,85 @@ const boundsInfo = computed(() => {
         <div class="section">
           <div class="section-title">
             切割顺序（后序遍历 · 先内后外）
-            <span class="tag">层深</span>
+            <span class="spacer" style="margin-left:auto"></span>
+            <button v-if="!manual" class="tiny" :disabled="isBatchMode || steps.length < 2" @click="beginManual">
+              ✎ 手工调序
+            </button>
+            <template v-else>
+              <button class="tiny" title="绕开固定段，重新优化其余段" @click="reopt">⟳ 绕开固定重排</button>
+              <button class="tiny danger" @click="resetManual">↩ 退回自动</button>
+            </template>
           </div>
-          <div class="order-list">
+          <div v-if="isBatchMode" class="hint" style="margin-bottom: 5px">批量排版的顺序为自动生成；关闭批量排版后可手工调序。</div>
+          <div v-else-if="manual" class="hint" style="margin-bottom: 5px">
+            拖动行调整顺序；点 <span class="kbd">📌</span> 固定该段（固定段不参与重排，也跨不过去）。
+            行尾 <span class="tag warn">±n</span> 为相对自动顺序的位置差。
+          </div>
+          <div class="order-list" :class="{ dragging: manual }" @dragover="onDragOver">
             <div
               v-for="st in steps"
-              :key="st.seq"
+              :key="st.seq + ':' + st.contourId + ':' + st.runIndex"
               class="list-item"
-              :class="{ active: selectedSeq === st.seq }"
+              :class="{
+                active: selectedSeq === st.seq,
+                pinned: pinnedSet.has(stepKey(st)),
+                moved: manual && rankDelta(st) !== 0,
+                draggable: manual,
+              }"
+              :draggable="manual && !pinnedSet.has(stepKey(st))"
               @click="locateStep(st)"
+              @dragstart="manual && onDragStart($event, st)"
+              @dragover="manual && onDragOver($event)"
+              @drop="manual && onDrop($event, st)"
             >
-              <span class="seq">{{ st.seq }}</span>
+              <span v-if="manual" class="drag-handle" :title="pinnedSet.has(stepKey(st)) ? '固定段（不可拖动）' : '拖动调整顺序'">⠿</span>
+              <span class="seq" :class="{ dim: !manual }">{{ st.seq }}</span>
               <span class="grow">
                 <span class="mono">{{ st.shapeName }}</span>
                 <span class="tag" style="margin-left: 5px">L{{ st.level }}{{ st.layer > 0 ? ` / 图层${st.layer + 1}` : '' }}</span>
                 <span v-if="st.runCount > 1" class="tag">连刀段 {{ st.runIndex + 1 }}/{{ st.runCount }}</span>
+                <span v-if="manual && pinnedSet.has(stepKey(st))" class="tag ok">📌 固定</span>
               </span>
+              <span v-if="manual && rankDelta(st) !== 0" class="tag" :class="rankDelta(st) > 0 ? 'warn' : 'info'">
+                {{ rankDelta(st) > 0 ? '+' : '' }}{{ rankDelta(st) }}
+              </span>
+              <button
+                v-if="manual"
+                class="tiny pin-btn"
+                :class="{ on: pinnedSet.has(stepKey(st)) }"
+                :title="pinnedSet.has(stepKey(st)) ? '取消固定' : '固定此段'"
+                @click.stop="togglePin(st)"
+              >
+                {{ pinnedSet.has(stepKey(st)) ? '📌' : '📍' }}
+              </button>
               <span class="mono dim">{{ st.lengthMm.toFixed(1) }}mm</span>
               <span class="mono dim">↗{{ st.travelFromPrevMm.toFixed(1) }}</span>
             </div>
           </div>
           <div class="hint">数字为刀路顺序气泡；↗ 为从上一段末尾跳过来的距离（mm）。跳刀用虚线画出，越小越省时间。</div>
+        </div>
+
+        <div v-if="manual && !manualStale && manualInfo" class="section">
+          <div class="section-title">手工 vs 自动 对比（按当前位置并排）</div>
+          <div class="compare-grid">
+            <div class="compare-head"><span>#</span><span>手工顺序</span><span>自动序号</span><span>该段跳刀</span></div>
+            <div
+              v-for="st in steps"
+              :key="'cmp' + st.seq + st.contourId + st.runIndex"
+              class="compare-row"
+              :class="{ diff: rankDelta(st) !== 0, pinned: pinnedSet.has(stepKey(st)) }"
+              @click="locateStep(st)"
+            >
+              <span class="seq sm">{{ st.seq }}</span>
+              <span class="cmp-name">
+                {{ st.shapeName }}
+                <span v-if="pinnedSet.has(stepKey(st))" class="tag ok">固定</span>
+              </span>
+              <span class="mono dim">{{ (autoRankByKey.get(stepKey(st)) ?? -1) + 1 }}</span>
+              <span class="mono dim">↗{{ st.travelFromPrevMm.toFixed(1) }}</span>
+            </div>
+          </div>
+          <div class="hint">高亮行为与自动顺序位置不同的段；总差 {{ manualInfo.stats.movedCount }} 段，跳刀 {{ job?.travelMm.toFixed(1) }}mm / 自动 {{ job?.autoTravelMm.toFixed(1) }}mm。</div>
         </div>
 
         <div class="section">
@@ -447,8 +625,14 @@ const boundsInfo = computed(() => {
               <tr><th>连刀点宽度</th><td>{{ project.settings.bridgeWidthMm }} mm</td></tr>
               <tr><th>纸幅</th><td>{{ project.sheet.widthMm }}×{{ project.sheet.heightMm }} mm（{{ project.sheet.name }}）</td></tr>
               <tr><th>刀路总长</th><td>{{ (job?.cutLengthMm ?? 0).toFixed(1) }} mm</td></tr>
-              <tr><th>跳刀总长</th><td>{{ (job?.travelMm ?? 0).toFixed(1) }} mm（朴素 {{ (job?.naiveTravelMm ?? 0).toFixed(1) }} mm）</td></tr>
-              <tr><th>预计用时</th><td>{{ printTime }}</td></tr>
+              <tr>
+                <th>跳刀总长</th>
+                <td>
+                  {{ (job?.travelMm ?? 0).toFixed(1) }} mm（{{ manual ? '手工顺序' : '自动优化' }}｜自动顺序 {{ (job?.autoTravelMm ?? 0).toFixed(1) }} mm｜朴素 {{ (job?.naiveTravelMm ?? 0).toFixed(1) }} mm
+                  <template v-if="manual && extraTravel > 0.005">；手工较自动多 {{ extraTravel.toFixed(1) }} mm</template>）
+                </td>
+              </tr>
+              <tr><th>预计用时</th><td>{{ printTime }}（切割 {{ material?.speedMmS }}mm/s × {{ material?.passes }} 遍，跳刀 120mm/s）</td></tr>
             </tbody>
           </table>
           <div class="card-note">
@@ -483,6 +667,117 @@ const boundsInfo = computed(() => {
   display: flex;
   flex-direction: column;
   gap: 3px;
+}
+
+.order-list.dragging {
+  max-height: 320px;
+}
+
+.list-item.draggable {
+  cursor: grab;
+}
+
+.list-item.draggable:active {
+  cursor: grabbing;
+}
+
+.drag-handle {
+  flex: 0 0 auto;
+  color: var(--text-mute);
+  font-size: 13px;
+  width: 12px;
+  text-align: center;
+  user-select: none;
+}
+
+.list-item.pinned {
+  border-color: rgba(71, 192, 122, 0.55);
+  background: rgba(71, 192, 122, 0.08);
+  cursor: pointer;
+}
+
+.list-item.moved:not(.active) {
+  border-color: rgba(255, 200, 87, 0.4);
+}
+
+.pin-btn {
+  padding: 1px 4px;
+  line-height: 1;
+}
+
+.pin-btn.on {
+  border-color: rgba(71, 192, 122, 0.6);
+  color: var(--ok);
+}
+
+.banner.manual {
+  background: rgba(90, 169, 255, 0.08);
+  border: 1px solid rgba(90, 169, 255, 0.4);
+  color: #c4ddff;
+  padding: 7px 9px;
+  border-radius: 6px;
+  margin-bottom: 8px;
+  font-size: 12px;
+}
+
+.kbd {
+  font-family: var(--mono);
+}
+
+.compare-grid {
+  border: 1px solid var(--line-soft);
+  border-radius: 5px;
+  overflow: auto;
+  max-height: 240px;
+}
+
+.compare-head,
+.compare-row {
+  display: grid;
+  grid-template-columns: 34px 1fr 64px 70px;
+  gap: 6px;
+  align-items: center;
+  padding: 3px 8px;
+  font-size: 11.5px;
+}
+
+.compare-head {
+  position: sticky;
+  top: 0;
+  background: var(--panel-3);
+  color: var(--text-mute);
+  font-size: 10.5px;
+  z-index: 1;
+}
+
+.compare-row {
+  border-top: 1px solid var(--line-soft);
+  cursor: pointer;
+}
+
+.compare-row:hover {
+  background: rgba(255, 143, 60, 0.08);
+}
+
+.compare-row.diff {
+  background: rgba(255, 200, 87, 0.07);
+}
+
+.compare-row.pinned .seq {
+  background: var(--ok);
+  color: #06210f;
+}
+
+.seq.sm {
+  width: 18px;
+  height: 18px;
+  font-size: 10px;
+}
+
+.cmp-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .dim {

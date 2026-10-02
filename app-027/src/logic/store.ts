@@ -8,12 +8,14 @@ import {
   type CutSettings,
   type ExportCfg,
   type MaterialPreset,
+  type OrderOverride,
   type Project,
   type Shape,
   type Sheet,
 } from './types'
 import { computeShape, shapeSignature, type ComputedShape } from './pipeline'
 import { buildBatchShape, buildJob, type Job } from './job'
+import { initialOverride, moveKey, reoptimizeManual } from './manualOrder'
 import { uid } from './geometry'
 import { importSvgText, type ImportResult } from './importer'
 import { defaultMaterials } from '@/data/materials'
@@ -175,7 +177,7 @@ export function jobOf(p: Project): { job: Job; shape: Shape | null; isBatch: boo
     const c = computedCache[s.id]
     if (c) map.set(s.id, c)
   }
-  const job = buildJob(p.shapes, map, layerOrderOf(p), { sharedEdge: false, start })
+  const job = buildJob(p.shapes, map, layerOrderOf(p), { sharedEdge: false, start, override: p.manualOrder ?? null })
   return { job, shape: null, isBatch: false, computed: map }
 }
 
@@ -244,6 +246,8 @@ export function duplicateProject(id: string): Project | null {
       c.bridges = []
     }
   }
+  // id 全部重新分配，旧手工顺序的段 key 已失效
+  copy.manualOrder = undefined
   state.projects.unshift(copy)
   recomputeProject(copy, true)
   scheduleSave()
@@ -409,6 +413,61 @@ export function applySymmetry(p: Project, shapeId: string, op: 'mirror_x' | 'mir
   touch(p)
 }
 
+// ---------------- 手工切割顺序 ----------------
+
+/** 进入手工调序：以当前自动顺序为起点 */
+export function beginManualOrder(p: Project): void {
+  const { job } = jobOf(p)
+  p.manualOrder = initialOverride(job.autoSteps)
+  touch(p)
+}
+
+/** 放弃手工调序，一键退回自动结果 */
+export function resetManualOrder(p: Project): void {
+  p.manualOrder = undefined
+  touch(p)
+}
+
+function mutateOrder(p: Project, fn: (ov: OrderOverride, job: Job) => OrderOverride | null): boolean {
+  const { job } = jobOf(p)
+  const base = p.manualOrder
+  // 失效的手工顺序不允许继续编辑，需先退回自动
+  if (!base || (job.manualStale && !job.manualResult)) return false
+  const next = fn(base, job)
+  if (!next) return false
+  p.manualOrder = next
+  touch(p)
+  return true
+}
+
+/** 拖动：把段 key 移到绝对位置 to（固定段不可跨越） */
+export function moveManualStep(p: Project, key: string, to: number): void {
+  mutateOrder(p, (ov) => ({ order: moveKey(ov.order, new Set(ov.pinned), key, to), pinned: ov.pinned }))
+}
+
+/** 固定 / 取消固定某段（固定后优化与拖动都绕开它） */
+export function toggleManualPin(p: Project, key: string): void {
+  mutateOrder(p, (ov) => {
+    const pinned = new Set(ov.pinned)
+    if (pinned.has(key)) pinned.delete(key)
+    else pinned.add(key)
+    return { order: ov.order, pinned: ov.order.filter((k) => pinned.has(k)) }
+  })
+}
+
+/** 绕开固定段重新优化其余段 */
+export function reoptimizeManualOrder(p: Project): void {
+  mutateOrder(p, (ov, job) => {
+    const res = reoptimizeManual(job.autoSteps, ov)
+    return res ? { order: res.order, pinned: res.pinned } : null
+  })
+}
+
+/** 几何变化导致手工顺序失效时，丢弃失效覆盖回到自动 */
+export function dropStaleManualOrder(p: Project): void {
+  if (p.manualOrder) resetManualOrder(p)
+}
+
 // ---------------- 材料预设 ----------------
 
 export function upsertMaterial(m: MaterialPreset): void {
@@ -492,4 +551,10 @@ export const store = {
   recomputeAll,
   importSvgToShapes,
   touch,
+  beginManualOrder,
+  resetManualOrder,
+  moveManualStep,
+  toggleManualPin,
+  reoptimizeManualOrder,
+  dropStaleManualOrder,
 }
